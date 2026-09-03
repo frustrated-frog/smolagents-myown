@@ -755,18 +755,25 @@ You have been provided with these additional arguments, that you can access dire
         """Interrupts the agent execution."""
         self.interrupt_switch = True
 
+    # 将 Agent 的内部记忆转换为可作为下一轮模型输入的聊天消息列表。
     def write_memory_to_messages(
-        self,
-        summary_mode: bool = False,
+            # 当前 Agent 实例。
+            self,
+            # 是否以摘要模式生成消息；默认为保留完整细节。
+            summary_mode: bool = False,
     ) -> list[ChatMessage]:
         """
         Reads past llm_outputs, actions, and observations or errors from the memory into a series of messages
         that can be used as input to the LLM. Adds a number of keywords (such as PLAN, error, etc) to help
         the LLM.
         """
+        # 先将系统提示词转换为消息，作为上下文的起点。
         messages = self.memory.system_prompt.to_messages(summary_mode=summary_mode)
+        # 依次处理任务、规划、行动等所有已记录的记忆步骤。
         for memory_step in self.memory.steps:
+            # 将当前步骤转换为一条或多条消息，并追加到上下文列表中。
             messages.extend(memory_step.to_messages(summary_mode=summary_mode))
+        # 返回按时间顺序组装好的模型上下文。
         return messages
 
     def _step_stream(

@@ -38,12 +38,18 @@ class ToolCall:
         }
 
 
+# 将该类声明为数据类，便于子类定义和管理步骤数据。
 @dataclass
+# 定义记忆步骤的抽象基类，供具体步骤类型继承。
 class MemoryStep:
+    # 将当前数据类实例转换为字典。
     def dict(self):
+        # 使用 dataclasses.asdict 递归转换实例及其嵌套数据类字段。
         return asdict(self)
 
+    # 将记忆步骤转换为聊天消息列表；summary_mode 控制是否使用摘要形式。
     def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
+        # 强制子类实现自己的消息转换逻辑。
         raise NotImplementedError
 
 
