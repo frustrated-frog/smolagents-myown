@@ -70,27 +70,35 @@ class ActionStep(MemoryStep):
     is_final_answer: bool = False
 
     def dict(self):
-        # We overwrite the method to parse the tool_calls and action_output manually
+        # 手动序列化特殊字段，确保结果适合保存或传输。
         return {
+            # 保留步骤编号和计时信息。
             "step_number": self.step_number,
             "timing": self.timing.dict(),
+            # 将嵌套的聊天消息递归转为字典，并处理其中不可直接 JSON 序列化的值。
             "model_input_messages": [
                 make_json_serializable(get_dict_from_nested_dataclasses(msg)) for msg in self.model_input_messages
             ]
             if self.model_input_messages
             else None,
+            # 逐个调用 ToolCall.dict，统一工具调用的输出结构。
             "tool_calls": [tc.dict() for tc in self.tool_calls] if self.tool_calls else [],
+            # 仅在有错误时序列化错误详情。
             "error": self.error.dict() if self.error else None,
+            # 模型输出消息同样需要先展开嵌套数据类，再转换为 JSON 兼容的数据。
             "model_output_message": make_json_serializable(get_dict_from_nested_dataclasses(self.model_output_message))
             if self.model_output_message
             else None,
             "model_output": self.model_output,
             "code_action": self.code_action,
             "observations": self.observations,
+            # 将图像对象提取为原始字节；没有图像时保留 None。
             "observations_images": [image.tobytes() for image in self.observations_images]
             if self.observations_images
             else None,
+            # 将任意类型的工具执行结果转换为可 JSON 序列化的形式。
             "action_output": make_json_serializable(self.action_output),
+            # TokenUsage 是数据类，使用 asdict 转为普通字典。
             "token_usage": asdict(self.token_usage) if self.token_usage else None,
             "is_final_answer": self.is_final_answer,
         }

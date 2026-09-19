@@ -443,6 +443,18 @@ class MultiStepAgent(ABC):
         max_steps: int | None = None,
         return_full_result: bool | None = None,
     ) -> Any | RunResult:
+        # 针对给定任务运行 Agent。
+        #
+        # 参数：
+        # - task：要执行的任务文本。
+        # - stream：是否以流式模式运行。为 True 时返回生成器，调用方需迭代它以获取每个执行步骤；为 False 时，内部完成全部步骤后只返回最终答案。
+        # - reset：是否重置对话；为 False 时保留上一次运行的上下文。
+        # - images：可选的 Pillow 图像对象列表。
+        # - additional_args：可选的额外运行参数，例如图像或 DataFrame；会以清晰的变量名提供给 Agent。
+        # - max_steps：本次最多允许执行的步骤数；未传入时使用 Agent 的默认值。
+        # - return_full_result：是否返回完整的 RunResult，还是仅返回最终输出；为 None 时沿用实例配置。
+        #
+        # 示例：创建一个没有额外工具的 CodeAgent，并让它计算 2 的 3.7384 次方。
         """
         Run the agent for the given task.
 
@@ -465,6 +477,7 @@ class MultiStepAgent(ABC):
         agent.run("What is the result of 2 power 3.7384?")
         ```
         """
+        # 调用该函数的时候如果传了 max_steps 就使用传入的，不然就使用初始化的时候设置的
         max_steps = max_steps or self.max_steps
         self.task = task
         self.interrupt_switch = False
@@ -487,14 +500,18 @@ You have been provided with these additional arguments, that you can access dire
         )
         self.memory.steps.append(TaskStep(task=self.task, task_images=images))
 
+        # 仅当当前 Agent 配置了 Python 执行器（例如 CodeAgent）时，才向执行环境注入上下文。
         if getattr(self, "python_executor", None):
+            # 将运行时状态作为变量发送给执行器，使生成的代码可直接使用它们。
             self.python_executor.send_variables(variables=self.state)
+            # 合并普通工具与受管 Agent，并注册到执行器，供生成的代码调用。
             self.python_executor.send_tools({**self.tools, **self.managed_agents})
 
         if stream:
             # The steps are returned as they are executed through a generator to iterate on.
             return self._run_stream(task=self.task, max_steps=max_steps, images=images)
 
+        # 记录开始执行的时间
         run_start_time = time.time()
         steps = list(self._run_stream(task=self.task, max_steps=max_steps, images=images))
 
@@ -540,6 +557,28 @@ You have been provided with these additional arguments, that you can access dire
     def _run_stream(
         self, task: str, max_steps: int, images: list["PIL.Image.Image"] | None = None
     ) -> Generator[ActionStep | PlanningStep | FinalAnswerStep | ChatMessageStreamDelta]:
+        """以生成器形式执行 Agent 的完整推理循环。
+
+        与 ``run`` 一次性返回最终结果不同，此内部方法会在每个步骤产生中间事件，
+        使调用方能够实时展示模型的流式输出、规划过程及工具执行记录。循环从第
+        1 步开始，在获得最终答案、达到 ``max_steps`` 上限，或被 ``interrupt_switch``
+        中断时结束。
+
+        每轮会按 ``planning_interval`` 的设置先执行可选的规划步骤，随后创建并执行
+        一个 ``ActionStep``。每个完成的步骤都会写入 ``self.memory``，并由
+        ``_finalize_step`` 补全耗时、观察结果和错误等收尾信息；因此该方法除了产出
+        事件外，也会持续更新 Agent 的运行状态。
+
+        Args:
+            task: 本次运行需要解决的原始用户任务；规划和动作步骤都会据此生成提示词。
+            max_steps: 最多可执行的动作步骤数，用于避免 Agent 陷入无限循环。
+            images: 可选的输入图片列表，作为首个动作步骤的视觉观察信息传入。
+
+        Yields:
+            模型生成过程中的 ``ChatMessageStreamDelta``，以及已完成的规划、动作或
+            最终答案步骤。调用方应按产生顺序消费它们，不能假设每一轮都会产生相同
+            类型或数量的事件。
+        """
         self.step_number = 1
         returned_final_answer = False
         while not returned_final_answer and self.step_number <= max_steps:
@@ -547,23 +586,32 @@ You have been provided with these additional arguments, that you can access dire
                 raise AgentError("Agent interrupted.", self.logger)
 
             # Run a planning step if scheduled
+            # 是否需要规划：
+            # 为 None：整个运行过程不做规划。
+            # 为整数 N：第 1、N + 1、2N + 1 ... 个动作步骤前生成一次计划。
             if self.planning_interval is not None and (
                 self.step_number == 1 or (self.step_number - 1) % self.planning_interval == 0
             ):
                 planning_start_time = time.time()
                 planning_step = None
+                # 调用生成计划的函数，流式返回
                 for element in self._generate_planning_step(
                     task, is_first_step=len(self.memory.steps) == 1, step=self.step_number
                 ):  # Don't use the attribute step_number here, because there can be steps from previous runs
                     yield element
+                    # planning_step才是真正作为可持久化的最终记忆
                     planning_step = element
+                # 这是一项运行期断言：若 _generate_planning_step() 没有按约定以 PlanningStep 收尾，
+                # 立即报错，避免后面的字段访问产生更隐蔽的错误。
                 assert isinstance(planning_step, PlanningStep)  # Last yielded element should be a PlanningStep
                 planning_end_time = time.time()
                 planning_step.timing = Timing(
                     start_time=planning_start_time,
                     end_time=planning_end_time,
                 )
+                # 会调用注册的步骤回调，例如日志、监控或持久化钩子。
                 self._finalize_step(planning_step)
+                # 将计划写入 Agent 的长期运行记忆，使后续动作和下一次重新规划能看到这个计划。
                 self.memory.steps.append(planning_step)
 
             # Start action step!
@@ -636,6 +684,9 @@ You have been provided with these additional arguments, that you can access dire
         self.memory.steps.append(final_memory_step)
         return final_answer.content
 
+    # Generator式返回，分为流式的输出和最终的完整输出
+    # 流式只是为了UI界面能实时渲染输出的内容
+    # PlanningStep才是最终写入持久化的记忆，并且PlanningStep是一个完整的内容
     def _generate_planning_step(
         self, task, is_first_step: bool, step: int
     ) -> Generator[ChatMessageStreamDelta | PlanningStep]:
@@ -655,18 +706,27 @@ You have been provided with these additional arguments, that you can access dire
                     ],
                 )
             ]
+            # self.stream_outputs：Agent 配置上允许实时流式输出；
+            # self.model 有 generate_stream 方法：当前模型适配器确实实现了流式生成能力。
             if self.stream_outputs and hasattr(self.model, "generate_stream"):
                 plan_message_content = ""
+                # <end_plan> ：是规划提示词中约定的结束标记。传给模型后，模型生成到这个标记时应停止，或由模型适配层从结果中截断后续内容。
                 output_stream = self.model.generate_stream(input_messages, stop_sequences=["<end_plan>"])  # type: ignore
                 input_tokens, output_tokens = 0, 0
+                # Live(...) 创建可反复刷新的终端区域；
                 with Live("", console=self.logger.console, vertical_overflow="visible") as live:
                     for event in output_stream:
                         if event.content is not None:
+                            # 每收到一个模型片段：
+                            # 1. 拼接到 plan_message_content；
+                            # 2. 更新终端画面；
+                            # 3. 将原始 event 交给外部调用方。
                             plan_message_content += event.content
                             live.update(Markdown(plan_message_content))
                             if event.token_usage:
                                 input_tokens = event.token_usage.input_tokens
                                 output_tokens += event.token_usage.output_tokens
+                        # 对外的流式返回
                         yield event
             else:
                 plan_message = self.model.generate(input_messages, stop_sequences=["<end_plan>"])
@@ -679,8 +739,8 @@ You have been provided with these additional arguments, that you can access dire
                 f"""Here are the facts I know and the plan of action that I will follow to solve the task:\n```\n{plan_message_content}\n```"""
             )
         else:
-            # Summary mode removes the system prompt and previous planning messages output by the model.
-            # Removing previous planning messages avoids influencing too much the new plan.
+            # 摘要模式会移除系统提示以及模型输出的先前规划消息。
+            # 移除先前规划消息可避免对新计划产生过多影响。
             memory_messages = self.write_memory_to_messages(summary_mode=True)
             plan_update_pre = ChatMessage(
                 role=MessageRole.SYSTEM,
